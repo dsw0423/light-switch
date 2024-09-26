@@ -15,7 +15,27 @@
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
-static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
+#define SWITCH_IP_ADDR  RTE_IPV4(10, 0, 0, 1)
+
+static unsigned nb_ports;
+static struct rte_mempool *mbuf_pool;
+
+struct mac_port_entry {
+    struct rte_ether_addr addr;
+    uint16_t port;
+};
+
+#define MAC_PORT_TABLE_SIZE 1024
+static struct mac_port_entry mac_port_table[MAC_PORT_TABLE_SIZE];
+static uint16_t nb_mac_port_entries;
+
+static struct rte_ether_addr ports_addr[RTE_MAX_ETHPORTS];
+static const struct rte_ether_addr broad_cast_macaddr = {
+    .addr_bytes = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+};
+
+static inline int
+port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
     struct rte_eth_conf port_conf;
     const uint16_t rx_rings = 1, tx_rings = 1;
     uint16_t nb_rxd = RX_RING_SIZE;
@@ -95,10 +115,54 @@ static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
     return 0;
 }
 
-#define SWITCH_IP_ADDR  RTE_IPV4(10, 0, 0, 1)
+static inline int 
+ether_addr_is_same(const struct rte_ether_addr *ea, const struct rte_ether_addr *eb) {
+    for (int i = 0; i < RTE_ETHER_ADDR_LEN; ++i)
+        if (ea->addr_bytes[i] != eb->addr_bytes[i])
+            return 0;
 
-static unsigned nb_ports;
-static struct rte_mempool *mbuf_pool;
+    return 1;
+}
+
+static void
+mac_flooding(struct rte_mbuf *m) {
+    printf("flooding\n");
+    fflush(stdout);
+
+    for (int p = 0; p < nb_ports; ++p) {
+        if (p != m->port) {
+            struct rte_mbuf *m_cloned = rte_pktmbuf_clone(m, mbuf_pool);
+            if (m_cloned) {
+                const uint16_t nb_tx = rte_eth_tx_burst(p, 0, &m_cloned, 1);
+                if (unlikely(nb_tx != 1))
+                    rte_pktmbuf_free(m_cloned);
+            }
+        }
+    }
+    rte_pktmbuf_free(m);
+}
+
+static void
+forward_out(struct rte_mbuf *m) {
+    struct rte_ether_hdr *ether = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    uint16_t i;
+
+    for (i = 0; i < nb_mac_port_entries; ++i) {
+        if (ether_addr_is_same(&ether->dst_addr, &mac_port_table[i].addr)) {
+            printf("forwarding\n");
+            fflush(stdout);
+
+            const uint16_t nb_tx = rte_eth_tx_burst(mac_port_table[i].port, 0, &m, 1);
+            if (unlikely(nb_tx != 1))
+                rte_pktmbuf_free(m);
+            break;
+        }
+    }
+
+    if (i == nb_mac_port_entries) {
+        mac_flooding(m);
+    }
+}
 
 static void
 process_arp(struct rte_mbuf *m, uint16_t port) {
@@ -125,36 +189,12 @@ process_arp(struct rte_mbuf *m, uint16_t port) {
                 rte_pktmbuf_free(m);
         }
     } else {
-        struct rte_mbuf *m_cloned;
-        for (int p = 0; p < nb_ports; ++p) {
-            if (p != port) {
-                m_cloned = rte_pktmbuf_clone(m, mbuf_pool);
-                if (m_cloned) {
-                    uint16_t nb_tx = rte_eth_tx_burst(p, 0, &m_cloned, 1);
-                    if (unlikely(nb_tx != 1))
-                        rte_pktmbuf_free(m_cloned);
-                }
-            }
-        }
-        rte_pktmbuf_free(m);
+        mac_flooding(m);
     }
 }
 
-static struct rte_ether_addr ports_addr[RTE_MAX_ETHPORTS];
-
-static const struct rte_ether_addr broad_cast_macaddr = {
-    .addr_bytes = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
-
-static inline int ether_addr_is_same(const struct rte_ether_addr *ea,
-                                     const struct rte_ether_addr *eb) {
-    for (int i = 0; i < RTE_ETHER_ADDR_LEN; ++i)
-        if (ea->addr_bytes[i] != eb->addr_bytes[i])
-            return 0;
-
-    return 1;
-}
-
-static int is_send_to_switch(struct rte_ether_addr *dst_addr) {
+static int
+is_send_to_switch(struct rte_ether_addr *dst_addr) {
     for (int i = 0; i < nb_ports; ++i) {
         if (ether_addr_is_same(&ports_addr[i], dst_addr))
             return 1;
@@ -162,7 +202,8 @@ static int is_send_to_switch(struct rte_ether_addr *dst_addr) {
     return 0;
 }
 
-static uint16_t icmp_checksum(void *addr, int count) {
+static uint16_t
+icmp_checksum(void *addr, int count) {
     register uint32_t sum = 0;
     uint16_t temp = *(uint16_t *)addr;
 
@@ -185,7 +226,8 @@ static uint16_t icmp_checksum(void *addr, int count) {
     return ~sum;
 }
 
-static void process_ipv4(struct rte_mbuf *m, uint16_t port) {
+static void
+process_ipv4(struct rte_mbuf *m, uint16_t port) {
     struct rte_ether_hdr *ether = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     struct rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(ether + 1);
     struct rte_icmp_hdr *icmp = (struct rte_icmp_hdr *)(ipv4 + 1);
@@ -258,13 +300,11 @@ static void process_ipv4(struct rte_mbuf *m, uint16_t port) {
         return;
     }
 
-forward_out:
-    const uint16_t nb_tx = rte_eth_tx_burst(port ^ 1, 0, &m, 1);
-    if (unlikely(nb_tx != 1))
-        rte_pktmbuf_free(m);
+    forward_out(m);
 }
 
-static void process_pkt(struct rte_mbuf *m, uint16_t port) {
+static void
+process_pkt(struct rte_mbuf *m, uint16_t port) {
     struct rte_ether_hdr *ether = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     uint16_t ether_type;
     struct rte_mbuf *m_local;
@@ -283,7 +323,8 @@ static void process_pkt(struct rte_mbuf *m, uint16_t port) {
     }
 }
 
-static __rte_noreturn int loop(void *dummy) {
+static __rte_noreturn int
+loop(void *dummy) {
     uint16_t port;
 
     /*
@@ -318,21 +359,43 @@ static __rte_noreturn int loop(void *dummy) {
                 struct rte_ether_hdr *ether =
                     rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
+                /* update mac_port_table */
+                uint16_t i;
+                for (i = 0; i < nb_mac_port_entries; ++i) {
+                    if (ether_addr_is_same(&mac_port_table[i].addr, &ether->src_addr)) {
+                        mac_port_table[i].port = port;
+                        break;
+                    }
+                }
+
+                /* insert a new entry */
+                if (i == nb_mac_port_entries) {
+                    struct mac_port_entry entry = {
+                        .addr = ether->src_addr,
+                        .port = port
+                    };
+
+                    /* simply reset the table if table is full. */
+                    if (nb_mac_port_entries == MAC_PORT_TABLE_SIZE)
+                        nb_mac_port_entries = 0;
+
+                    mac_port_table[nb_mac_port_entries++] = entry;
+                }
+
                 if (is_send_to_switch(&ether->dst_addr) ||
                     ether_addr_is_same(&ether->dst_addr, &broad_cast_macaddr))
                     process_pkt(m, port);
                 else {
-                    const uint16_t nb_tx = rte_eth_tx_burst(port ^ 1, 0, &m, 1);
-                    if (unlikely(nb_tx != 1))
-                        rte_pktmbuf_free(m);
+                    forward_out(m);
                 }
             }
         }
     }
 }
 
-int main(int argc, char *argv[]) {
-    
+int
+main(int argc, char *argv[]) {
+
     uint16_t portid;
 
     int ret = rte_eal_init(argc, argv);

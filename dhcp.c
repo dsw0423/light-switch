@@ -116,7 +116,7 @@ uint32_t dhcp_ack(uint8_t *data) {
 }
 
 struct rte_mbuf *process_dhcp(struct rte_mbuf *m, uint16_t port, uint16_t *len) {
-
+    static uint8_t free_host_number = 10;
     uint64_t pre_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
     struct dhcp_hdr *dhcp = rte_pktmbuf_mtod_offset(m, struct dhcp_hdr *, pre_len);
     uint8_t *option_origin = (uint8_t *)dhcp + sizeof(struct dhcp_hdr);
@@ -142,24 +142,22 @@ struct rte_mbuf *process_dhcp(struct rte_mbuf *m, uint16_t port, uint16_t *len) 
                         fflush(stdout);
                         options_len = dhcp_offer(skip_dhcp_magic_number(option_origin));
                         dhcp->op = DHCP_OP_REPLY;
-                        dhcp->yiaddr = rte_cpu_to_be_32(RTE_IPV4(10,0,0,10));
+                        dhcp->yiaddr = rte_cpu_to_be_32(RTE_IPV4(10,0,0,free_host_number));
                         dhcp->siaddr = rte_cpu_to_be_32(RTE_IPV4(10,0,0,1));
-                        /* TODO: multi segs */
                         m->pkt_len = m->data_len = (uint32_t)pre_len + (uint32_t)sizeof(struct dhcp_hdr) + 4 + options_len;
                         *len = (uint32_t)sizeof(struct dhcp_hdr) + 4 + options_len;
                         printf("pkt offer len = %d\n", m->pkt_len);
                         printf("DHCP header + data len = %d\n", *len);
                         fflush(stdout);
                         break;
-                    /* TODO: response DHCP request. */
+                    /* TODO: support lease renew. */
                     case DHCP_OPT_MESSAGE_TYPE_REQUEST:
                         printf("request\n");
                         fflush(stdout);
                         options_len = dhcp_ack(skip_dhcp_magic_number(option_origin));
                         dhcp->op = DHCP_OP_REPLY;
-                        dhcp->yiaddr = rte_cpu_to_be_32(RTE_IPV4(10,0,0,10));
+                        dhcp->yiaddr = rte_cpu_to_be_32(RTE_IPV4(10,0,0,free_host_number++));
                         dhcp->siaddr = rte_cpu_to_be_32(RTE_IPV4(10,0,0,1));
-                        /* TODO: multi segs */
                         m->pkt_len = m->data_len = (uint32_t)pre_len + (uint32_t)sizeof(struct dhcp_hdr) + 4 + options_len;
                         *len = (uint32_t)sizeof(struct dhcp_hdr) + 4 + options_len;
                         printf("pkt ack len = %d\n", m->pkt_len);
