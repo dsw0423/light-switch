@@ -4,9 +4,14 @@
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_errno.h>
+#include <rte_malloc.h>
 #include <stdint.h>
 
 #include "udp.h"
+#include "main.h"
+
+struct app_context app;
 
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
@@ -16,18 +21,6 @@
 #define BURST_SIZE 32
 
 #define SWITCH_IP_ADDR  RTE_IPV4(10, 0, 0, 1)
-
-static unsigned nb_ports;
-static struct rte_mempool *mbuf_pool;
-
-struct mac_port_entry {
-    struct rte_ether_addr addr;
-    uint16_t port;
-};
-
-#define MAC_PORT_TABLE_SIZE 1024
-static struct mac_port_entry mac_port_table[MAC_PORT_TABLE_SIZE];
-static uint16_t nb_mac_port_entries;
 
 static struct rte_ether_addr ports_addr[RTE_MAX_ETHPORTS];
 static const struct rte_ether_addr broad_cast_macaddr = {
@@ -56,9 +49,6 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
                strerror(-retval));
         return retval;
     }
-
-    printf("max_mtu = %d, min_mtu = %d\n", dev_info.max_mtu, dev_info.min_mtu);
-    fflush(stdout);
 
     if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
         port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
@@ -115,23 +105,14 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
     return 0;
 }
 
-static inline int 
-ether_addr_is_same(const struct rte_ether_addr *ea, const struct rte_ether_addr *eb) {
-    for (int i = 0; i < RTE_ETHER_ADDR_LEN; ++i)
-        if (ea->addr_bytes[i] != eb->addr_bytes[i])
-            return 0;
-
-    return 1;
-}
-
 static void
 mac_flooding(struct rte_mbuf *m) {
     printf("flooding\n");
     fflush(stdout);
 
-    for (int p = 0; p < nb_ports; ++p) {
+    for (int p = 0; p < app.nb_ports; ++p) {
         if (p != m->port) {
-            struct rte_mbuf *m_cloned = rte_pktmbuf_clone(m, mbuf_pool);
+            struct rte_mbuf *m_cloned = rte_pktmbuf_clone(m, app.mbuf_pool);
             if (m_cloned) {
                 const uint16_t nb_tx = rte_eth_tx_burst(p, 0, &m_cloned, 1);
                 if (unlikely(nb_tx != 1))
@@ -147,19 +128,19 @@ forward_out(struct rte_mbuf *m) {
     struct rte_ether_hdr *ether = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     uint16_t i;
 
-    for (i = 0; i < nb_mac_port_entries; ++i) {
-        if (ether_addr_is_same(&ether->dst_addr, &mac_port_table[i].addr)) {
+    for (i = 0; i < app.nb_mac_port_entries; ++i) {
+        if (ether_addr_is_same(&ether->dst_addr, &app.mac_port_table[i].addr)) {
             printf("forwarding\n");
             fflush(stdout);
 
-            const uint16_t nb_tx = rte_eth_tx_burst(mac_port_table[i].port, 0, &m, 1);
+            const uint16_t nb_tx = rte_eth_tx_burst(app.mac_port_table[i].port, 0, &m, 1);
             if (unlikely(nb_tx != 1))
                 rte_pktmbuf_free(m);
             break;
         }
     }
 
-    if (i == nb_mac_port_entries) {
+    if (i == app.nb_mac_port_entries) {
         mac_flooding(m);
     }
 }
@@ -195,7 +176,7 @@ process_arp(struct rte_mbuf *m, uint16_t port) {
 
 static int
 is_send_to_switch(struct rte_ether_addr *dst_addr) {
-    for (int i = 0; i < nb_ports; ++i) {
+    for (int i = 0; i < app.nb_ports; ++i) {
         if (ether_addr_is_same(&ports_addr[i], dst_addr))
             return 1;
     }
@@ -361,25 +342,25 @@ loop(void *dummy) {
 
                 /* update mac_port_table */
                 uint16_t i;
-                for (i = 0; i < nb_mac_port_entries; ++i) {
-                    if (ether_addr_is_same(&mac_port_table[i].addr, &ether->src_addr)) {
-                        mac_port_table[i].port = port;
+                for (i = 0; i < app.nb_mac_port_entries; ++i) {
+                    if (ether_addr_is_same(&app.mac_port_table[i].addr, &ether->src_addr)) {
+                        app.mac_port_table[i].port = port;
                         break;
                     }
                 }
 
                 /* insert a new entry */
-                if (i == nb_mac_port_entries) {
+                if (i == app.nb_mac_port_entries) {
                     struct mac_port_entry entry = {
                         .addr = ether->src_addr,
                         .port = port
                     };
 
                     /* simply reset the table if table is full. */
-                    if (nb_mac_port_entries == MAC_PORT_TABLE_SIZE)
-                        nb_mac_port_entries = 0;
+                    if (app.nb_mac_port_entries == MAC_PORT_TABLE_CAPACITY)
+                        app.nb_mac_port_entries = 0;
 
-                    mac_port_table[nb_mac_port_entries++] = entry;
+                    app.mac_port_table[app.nb_mac_port_entries++] = entry;
                 }
 
                 if (is_send_to_switch(&ether->dst_addr) ||
@@ -395,7 +376,6 @@ loop(void *dummy) {
 
 int
 main(int argc, char *argv[]) {
-
     uint16_t portid;
 
     int ret = rte_eal_init(argc, argv);
@@ -406,23 +386,71 @@ main(int argc, char *argv[]) {
     argv += ret;
 
     /* Check that there is an even number of ports to send/receive on. */
-    nb_ports = rte_eth_dev_count_avail();
-    if (nb_ports < 2 || (nb_ports & 1))
+    app.nb_ports = rte_eth_dev_count_avail();
+    if (app.nb_ports < 2 || (app.nb_ports & 1))
         rte_exit(EXIT_FAILURE, "Error: number of ports must be even\n");
 
     /* Allocates mempool to hold the mbufs. 8< */
-    mbuf_pool = rte_pktmbuf_pool_create(
-        "MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+    app.mbuf_pool = rte_pktmbuf_pool_create(
+        "MBUF_POOL", NUM_MBUFS * app.nb_ports, MBUF_CACHE_SIZE, 0,
         RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 
-    if (mbuf_pool == NULL)
+    if (app.mbuf_pool == NULL)
         rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
     /* Initializing all ports. 8< */
     RTE_ETH_FOREACH_DEV(portid) {
-        if (port_init(portid, mbuf_pool) != 0)
+        if (port_init(portid, app.mbuf_pool) != 0)
             rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", portid);
         rte_eth_macaddr_get(portid, &ports_addr[portid]);
+    }
+
+    app.rx_packet_dispatcher_ring =
+        rte_ring_create("rx_dispatcher",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+    
+    if (app.rx_packet_dispatcher_ring == NULL)
+        rte_exit(rte_errno, "rte_ring_create(): %s\n" , rte_strerror(rte_errno));
+
+    app.packet_dispatcher_processor_ring =
+        rte_ring_create("dispatcher_processor",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.packet_dispatcher_processor_ring == NULL)
+        rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
+
+    app.packet_dispatcher_tx_dispatcher_ring =
+        rte_ring_create("dispatcher_tx_dispatcher",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.packet_dispatcher_tx_dispatcher_ring == NULL)
+        rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
+    
+    app.processor_tx_dispatcher_ring =
+        rte_ring_create("processor_tx_dispatcher",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.processor_tx_dispatcher_ring == NULL)
+        rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
+
+    app.tx_rings_table = rte_malloc(NULL, sizeof(struct rte_ring *) * app.nb_ports , 0);
+    if (app.tx_rings_table == NULL)
+        rte_exit(EXIT_FAILURE, "rte_malloc() failed\n");
+    
+    for (int i = 0; i < app.nb_ports; ++i) {
+        char name[20];
+        snprintf(name, sizeof(name), "tx_ring%d", i);
+        app.tx_rings_table[i] = rte_ring_create(name, 1024, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+        if (app.tx_rings_table[i] == NULL)
+            rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
     }
 
     if (rte_lcore_count() > 1)
