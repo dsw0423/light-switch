@@ -8,18 +8,12 @@
 
 #include "main.h"
 
-extern struct rte_mempool *mbuf_pool;
-
-extern struct rte_ring *packet_dispatcher_tx_dispatcher_ring;
-extern struct rte_ring *processor_tx_dispatcher_ring;
-extern struct rte_ring **tx_rings_table;
-
-extern struct mac_port_entry *mac_port_table;
-extern volatile uint16_t nb_mac_port_entries;
-
 static inline void
 send_to_port(const struct rte_mbuf **mbufs, uint16_t nb_bufs, uint16_t portid) {
     uint16_t nb_tx;
+
+    if (nb_bufs == 0)
+        return;
 
     nb_tx = rte_eth_tx_burst(portid, 0, mbufs, nb_bufs);
 
@@ -36,7 +30,7 @@ tx_all_ports_loop() {
 
     while (1) {
         for (uint16_t port = 0; port < app.nb_ports; ++port) {
-            tx_ring = tx_rings_table[port];
+            tx_ring = app.tx_rings_table[port];
             nb_pkts = rte_ring_dequeue_burst(tx_ring, mbufs, 16, NULL);
             send_to_port(mbufs, nb_pkts, port);
         }
@@ -47,9 +41,9 @@ static inline uint16_t
 get_dst_port(const struct rte_mbuf *m) {
     struct rte_ether_hdr *ether = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
-    for (uint16_t i = 0; i < nb_mac_port_entries; ++i) {
-        if (ether_addr_is_same(&mac_port_table[i].addr, &ether->dst_addr))
-            return mac_port_table[i].port;
+    for (uint16_t i = 0; i < app.nb_mac_port_entries; ++i) {
+        if (ether_addr_is_same(&app.mac_port_table[i].addr, &ether->dst_addr))
+            return app.mac_port_table[i].port;
     }
 
     return -1;
@@ -64,18 +58,45 @@ dispatch_pkts_to_tx_ring(const struct rte_mbuf **mbufs, uint16_t nb_pkts) {
     for (uint16_t i = 0; i < nb_pkts; ++i) {
         portid = get_dst_port(mbufs[i]);
         if (portid >= 0) {
-            tx_ring = tx_rings_table[portid];
+            tx_ring = app.tx_rings_table[portid];
             rte_ring_enqueue(tx_ring, mbufs[i]);
         } else {
             /* flooding */
             for (uint16_t port = 0; port < app.nb_ports; ++port) {
                 if (port != mbufs[i]->port) {
-                    m_cloned = rte_pktmbuf_clone(mbufs[i], mbuf_pool);
-                    rte_ring_enqueue(tx_rings_table[port], m_cloned);
+                    m_cloned = rte_pktmbuf_clone(mbufs[i], app.mbuf_pool);
+                    rte_ring_enqueue(app.tx_rings_table[port], m_cloned);
                 }
             }
             rte_pktmbuf_free(mbufs[i]);
         }
+    }
+}
+
+static void
+update_mac_port_table_with_pkt(const struct rte_mbuf *mbuf) {
+    struct rte_ether_hdr *ether = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+
+    for (uint16_t i = 0; i < app.nb_mac_port_entries; ++i) {
+        if (ether_addr_is_same(&ether->src_addr, &app.mac_port_table[i].addr)) {
+            app.mac_port_table[i].port = mbuf->port;
+            return;
+        }
+    }
+
+    /* simply reset the table if it is full. */
+    if (app.nb_mac_port_entries == MAC_PORT_TABLE_CAPACITY)
+        app.nb_mac_port_entries = 0;
+
+    /* insert a new entry. */
+    app.mac_port_table[app.nb_mac_port_entries].addr = ether->src_addr;
+    app.mac_port_table[app.nb_mac_port_entries++].port = mbuf->port;
+}
+
+static void
+update_mac_port_table(const struct rte_mbuf **mbufs, uint16_t nb_pkts) {
+    for (uint16_t i = 0; i < nb_pkts; ++i) {
+        update_mac_port_table_with_pkt(mbufs[i]);
     }
 }
 
@@ -86,11 +107,13 @@ tx_dispatcher_loop() {
 
     while (1) {
         /* dispatch packet_dispatcher ring. */
-        nb_pkts = rte_ring_dequeue_burst(packet_dispatcher_tx_dispatcher_ring, mbufs, 16, NULL);
+        nb_pkts = rte_ring_dequeue_burst(app.packet_dispatcher_tx_dispatcher_ring, mbufs, 16, NULL);
+        update_mac_port_table(mbufs, nb_pkts);
         dispatch_pkts_to_tx_ring(mbufs, nb_pkts);
 
         /* dispatch processor ring. */
-        nb_pkts = rte_ring_dequeue_burst(processor_tx_dispatcher_ring, mbufs, 16, NULL);
+        nb_pkts = rte_ring_dequeue_burst(app.processor_tx_dispatcher_ring, mbufs, 16, NULL);
+        update_mac_port_table(mbufs, nb_pkts);
         dispatch_pkts_to_tx_ring(mbufs, nb_pkts);
     }
 }

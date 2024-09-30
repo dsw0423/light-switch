@@ -10,6 +10,7 @@
 
 #include "udp.h"
 #include "main.h"
+#include "loop.h"
 
 struct app_context app;
 
@@ -22,7 +23,6 @@ struct app_context app;
 
 #define SWITCH_IP_ADDR  RTE_IPV4(10, 0, 0, 1)
 
-static struct rte_ether_addr ports_addr[RTE_MAX_ETHPORTS];
 static const struct rte_ether_addr broad_cast_macaddr = {
     .addr_bytes = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 };
@@ -177,7 +177,7 @@ process_arp(struct rte_mbuf *m, uint16_t port) {
 static int
 is_send_to_switch(struct rte_ether_addr *dst_addr) {
     for (int i = 0; i < app.nb_ports; ++i) {
-        if (ether_addr_is_same(&ports_addr[i], dst_addr))
+        if (ether_addr_is_same(&app.ports_addr[i], dst_addr))
             return 1;
     }
     return 0;
@@ -288,7 +288,6 @@ static void
 process_pkt(struct rte_mbuf *m, uint16_t port) {
     struct rte_ether_hdr *ether = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     uint16_t ether_type;
-    struct rte_mbuf *m_local;
 
     ether_type = rte_be_to_cpu_16(ether->ether_type);
     switch (ether_type) {
@@ -374,6 +373,59 @@ loop(void *dummy) {
     }
 }
 
+static int
+rings_init() {
+    app.rx_packet_dispatcher_ring =
+        rte_ring_create("rx_dispatcher",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.rx_packet_dispatcher_ring == NULL)
+        return rte_errno;
+
+    app.packet_dispatcher_processor_ring =
+        rte_ring_create("dispatcher_processor",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.packet_dispatcher_processor_ring == NULL)
+        return rte_errno;
+
+    app.packet_dispatcher_tx_dispatcher_ring =
+        rte_ring_create("dispatcher_tx_dispatcher",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.packet_dispatcher_tx_dispatcher_ring == NULL)
+        return rte_errno;
+
+    app.processor_tx_dispatcher_ring =
+        rte_ring_create("processor_tx_dispatcher",
+                        1024,
+                        rte_socket_id(),
+                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+
+    if (app.processor_tx_dispatcher_ring == NULL)
+        return rte_errno;
+
+    app.tx_rings_table = rte_malloc(NULL, sizeof(struct rte_ring *) * app.nb_ports , 0);
+    if (app.tx_rings_table == NULL)
+        return rte_errno;
+
+    for (int i = 0; i < app.nb_ports; ++i) {
+        char name[20];
+        snprintf(name, sizeof(name), "tx_ring%d", i);
+        app.tx_rings_table[i] = rte_ring_create(name, 1024, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+        if (app.tx_rings_table[i] == NULL)
+            return rte_errno;
+    }
+
+    return 0;
+}
+
 int
 main(int argc, char *argv[]) {
     uint16_t portid;
@@ -384,6 +436,8 @@ main(int argc, char *argv[]) {
 
     argc -= ret;
     argv += ret;
+
+    app.switch_ipv4_addr = RTE_IPV4(10, 0, 0, 1);
 
     /* Check that there is an even number of ports to send/receive on. */
     app.nb_ports = rte_eth_dev_count_avail();
@@ -402,56 +456,12 @@ main(int argc, char *argv[]) {
     RTE_ETH_FOREACH_DEV(portid) {
         if (port_init(portid, app.mbuf_pool) != 0)
             rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", portid);
-        rte_eth_macaddr_get(portid, &ports_addr[portid]);
+        rte_eth_macaddr_get(portid, &app.ports_addr[portid]);
     }
 
-    app.rx_packet_dispatcher_ring =
-        rte_ring_create("rx_dispatcher",
-                        1024,
-                        rte_socket_id(),
-                        RING_F_SP_ENQ | RING_F_SC_DEQ);
-    
-    if (app.rx_packet_dispatcher_ring == NULL)
-        rte_exit(rte_errno, "rte_ring_create(): %s\n" , rte_strerror(rte_errno));
-
-    app.packet_dispatcher_processor_ring =
-        rte_ring_create("dispatcher_processor",
-                        1024,
-                        rte_socket_id(),
-                        RING_F_SP_ENQ | RING_F_SC_DEQ);
-
-    if (app.packet_dispatcher_processor_ring == NULL)
-        rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
-
-    app.packet_dispatcher_tx_dispatcher_ring =
-        rte_ring_create("dispatcher_tx_dispatcher",
-                        1024,
-                        rte_socket_id(),
-                        RING_F_SP_ENQ | RING_F_SC_DEQ);
-
-    if (app.packet_dispatcher_tx_dispatcher_ring == NULL)
-        rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
-    
-    app.processor_tx_dispatcher_ring =
-        rte_ring_create("processor_tx_dispatcher",
-                        1024,
-                        rte_socket_id(),
-                        RING_F_SP_ENQ | RING_F_SC_DEQ);
-
-    if (app.processor_tx_dispatcher_ring == NULL)
-        rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
-
-    app.tx_rings_table = rte_malloc(NULL, sizeof(struct rte_ring *) * app.nb_ports , 0);
-    if (app.tx_rings_table == NULL)
-        rte_exit(EXIT_FAILURE, "rte_malloc() failed\n");
-    
-    for (int i = 0; i < app.nb_ports; ++i) {
-        char name[20];
-        snprintf(name, sizeof(name), "tx_ring%d", i);
-        app.tx_rings_table[i] = rte_ring_create(name, 1024, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-        if (app.tx_rings_table[i] == NULL)
-            rte_exit(rte_errno, "rte_ring_create(): %s\n", rte_strerror(rte_errno));
-    }
+    ret = rings_init();
+    if (ret)
+        rte_exit(ret, "rings_init(): %s\n", rte_strerror(ret));
 
     if (rte_lcore_count() > 1)
         printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");

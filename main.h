@@ -14,6 +14,7 @@ struct mac_port_entry {
 #define MAC_PORT_TABLE_CAPACITY 1024
 
 struct app_context {
+    uint32_t switch_ipv4_addr;                              /* switch ipv4 addr in host byte order. */
     uint16_t nb_ports;                                      /* number of ethernet ports. */
     struct rte_mempool *mbuf_pool;                          /* mempool from which mbufs are allocated. */
     struct rte_ring *rx_packet_dispatcher_ring;             /* rx to packet_dispatcher ring. */
@@ -24,6 +25,7 @@ struct app_context {
 
     struct mac_port_entry mac_port_table[MAC_PORT_TABLE_CAPACITY];    /* mac forwarding table. */
     volatile uint16_t nb_mac_port_entries;                  /* size of mac_port_table. */
+    struct rte_ether_addr ports_addr[RTE_MAX_ETHPORTS];
 };
 
 /* global context */

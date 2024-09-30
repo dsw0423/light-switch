@@ -8,9 +8,7 @@
 
 #include "main.h"
 
-extern struct rte_ring *rx_dispatcher_ring;
-
-#define RX_MBUF_TABLE_SIZE 1024
+#define RX_MBUF_TABLE_SIZE 16
 static struct rte_mbuf *rx_mbuf_table[RX_MBUF_TABLE_SIZE];
 
 static void
@@ -21,10 +19,10 @@ rx_port(uint16_t portid) {
     nb_rx = rte_eth_rx_burst(portid, 0, rx_mbuf_table, RX_MBUF_TABLE_SIZE);
     if (nb_rx == 0)
         return;
-    
+
     nb_enque = 0;
     do {
-        nb_enque += rte_ring_enqueue_burst(rx_dispatcher_ring, rx_mbuf_table, nb_rx, NULL);
+        nb_enque += rte_ring_enqueue_burst(app.rx_packet_dispatcher_ring, rx_mbuf_table, nb_rx, NULL);
     } while (nb_enque < nb_rx);
 }
 
